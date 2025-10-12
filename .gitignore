@@ -20,3 +20,22 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+ 
+# --- Project-specific ignores: datasets and model weights ---
+# Datasets
+dataset/
+
+# Model weights directories
+weights/
+
+# Common weight/serialization file types
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.tflite
+*.h5
+*.weights
+*.pb
+*.engine
+*.trt
