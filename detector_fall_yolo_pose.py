@@ -8,6 +8,7 @@ import logging
 
 import cv2
 import numpy as np
+from vision.seg_bed import load_seg_model, detect_bed_mask, overlay_mask
 
 try:
     from ultralytics import YOLO
@@ -378,6 +379,8 @@ def process_video(
     model_size: str = "n",
     downsample: int = 1,
     log_every: int = 30,
+    seg_size: str = "n",
+    seg_imgsz: int = 640,
 ) -> str:
     logger = logging.getLogger("fall_detection")
     ensure_dirs(weights_dir, results_dir)
@@ -385,6 +388,14 @@ def process_video(
 
     model = YOLO(weights_path)
     logger.info(f"Loaded model weights: {weights_path}")
+
+    # Load segmentation model once (for bed detection)
+    seg_model = None
+    try:
+        seg_model = load_seg_model(weights_dir, seg_size)
+        logger.info(f"Loaded segmentation weights (bed): size={seg_size}")
+    except Exception as exc:
+        logger.warning(f"Segmentation model unavailable: {exc}")
 
     cap = cv2.VideoCapture(source_video_path)
     if not cap.isOpened():
@@ -439,6 +450,8 @@ def process_video(
 
     try:
         frame_index = 0
+        bed_mask = None
+        bed_bbox = None  # (x1, y1, x2, y2) in frame coordinates
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -447,6 +460,28 @@ def process_video(
             # Resize the frame if downsampling is enabled
             if downsample > 1:
                 frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+            # On the very first frame (after any resizing), run bed segmentation once
+            if frame_index == 0 and seg_model is not None and bed_mask is None:
+                try:
+                    bed_mask = detect_bed_mask(seg_model, frame, imgsz=seg_imgsz, conf=0.3, iou=0.45)
+                    if bed_mask is not None:
+                        # Compute bed mask bounding box once
+                        ys, xs = np.where(bed_mask > 0)
+                        if xs.size > 0 and ys.size > 0:
+                            bed_bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+                            logger.info(f"Bed mask detected on first frame. bbox={bed_bbox}")
+                        else:
+                            bed_bbox = None
+                            logger.info("Bed mask detected on first frame, but empty area.")
+                    else:
+                        logger.info("No bed detected on first frame.")
+                except Exception as exc:
+                    logger.warning(f"Bed segmentation failed: {exc}")
+
+            # Overlay bed mask if available
+            if bed_mask is not None:
+                overlay_mask(frame, bed_mask, color=(255, 0, 0), alpha=0.25)
 
             results = model.predict(
                 source=frame,
@@ -514,6 +549,28 @@ def process_video(
 
             active_tracks = updated_tracks
 
+            # Helpers for mask-based rules
+            def bbox_mask_overlap_ratio(mask: Optional[np.ndarray], x1: int, y1: int, x2: int, y2: int) -> float:
+                if mask is None:
+                    return 0.0
+                xi1 = max(0, min(x1, x2))
+                yi1 = max(0, min(y1, y2))
+                xi2 = min(mask.shape[1], max(x1, x2))
+                yi2 = min(mask.shape[0], max(y1, y2))
+                if xi2 <= xi1 or yi2 <= yi1:
+                    return 0.0
+                crop = mask[yi1:yi2, xi1:xi2]
+                area = max(1, (xi2 - xi1) * (yi2 - yi1))
+                on_bed = int(np.count_nonzero(crop))
+                return float(on_bed) / float(area)
+
+            def point_in_mask(mask: Optional[np.ndarray], x: int, y: int) -> bool:
+                if mask is None:
+                    return False
+                if x < 0 or y < 0 or y >= mask.shape[0] or x >= mask.shape[1]:
+                    return False
+                return mask[y, x] > 0
+
             # Render per detection
             per_frame_fall_count = 0
             for i, box in enumerate(boxes):
@@ -548,8 +605,49 @@ def process_video(
 
                 color = (0, 255, 0) if not falling else (0, 0, 255)
                 x1i, y1i, x2i, y2i = xyxy_int(tuple(box.tolist()), width, height)
+                # Classify On Bed vs Falling if bed mask exists and falling posture detected
+                status_text = "No Falling"
+                if falling and bed_mask is not None:
+                    # Overlap heuristic
+                    overlap = bbox_mask_overlap_ratio(bed_mask, x1i, y1i, x2i, y2i)
+                    # Keypoint-in-mask heuristic (hips/shoulders)
+                    try:
+                        li = COCO_KP_NAMES.index("left_shoulder"); ri = COCO_KP_NAMES.index("right_shoulder")
+                        lhi = COCO_KP_NAMES.index("left_hip"); rhi = COCO_KP_NAMES.index("right_hip")
+                        ls = kp[li]; rs = kp[ri]; lh = kp[lhi]; rh = kp[rhi]
+                        keypoints_xy = []
+                        for p in (ls, rs, lh, rh):
+                            if p[2] >= 0.3:
+                                keypoints_xy.append((int(p[0]), int(p[1])))
+                        in_mask_count = sum(1 for (px, py) in keypoints_xy if point_in_mask(bed_mask, px, py))
+                    except Exception:
+                        in_mask_count = 0
+
+                    on_bed = (overlap >= 0.75) or (in_mask_count >= 2)
+
+                    # Additional rule: if bbox left is left of bed left AND bbox top is above bed top -> not on bed
+                    if bed_bbox is not None:
+                        bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox
+                        if (x1i < bed_x1) and (y1i < bed_y1):
+                            on_bed = False
+                            if log_every > 0 and (frame_index % max(1, log_every) == 0):
+                                logger.debug(
+                                    f"frame={frame_index} track={tid} rule(not-on-bed by left/top outside): "
+                                    f"person_left={x1i} < bed_left={bed_x1} and person_top={y1i} < bed_top={bed_y1}"
+                                )
+                    if on_bed:
+                        status_text = "On Bed"
+                        color = (255, 0, 0)
+                    else:
+                        status_text = "Falling"
+                    if log_every > 0 and (frame_index % max(1, log_every) == 0):
+                        logger.debug(
+                            f"frame={frame_index} track={tid} bed_check: overlap={overlap:.2f} in_mask={in_mask_count} -> {status_text}"
+                        )
+                else:
+                    status_text = "Falling" if falling else "No Falling"
+
                 draw_rounded_rectangle(frame, (x1i, y1i), (x2i, y2i), color, thickness=3, radius=12)
-                status_text = "Falling" if falling else "No Falling"
                 put_label_above_box(frame, status_text, (x1i, y1i, x2i, y2i), (255, 255, 255))
 
                 # Draw keypoints and skeleton
@@ -591,7 +689,7 @@ def process_video(
 
 
 
-DEFAULT_INPUT = "./dataset/Le2i/Home_01/Home_01/Videos/video (1).avi"
+DEFAULT_INPUT = "./dataset/Real/fall/video1.mp4"
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -602,7 +700,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "-ds", "--downsample",
         type=int,
         choices=[1, 2, 3, 4],
-        default=1,
+        default=4,
         help="Uniform downsampling factor: 1 (no downsample), 2 (1/2), 3 (1/3), 4 (1/4).",
     )
     parser.add_argument(
@@ -620,8 +718,21 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument(
         "--log-every",
         type=int,
-        default=10,
+        default=30,
         help="Emit per-frame summary and per-detection debug logs every N frames (0=disable).",
+    )
+    parser.add_argument(
+        "--seg-size",
+        type=str,
+        choices=["n", "s", "m", "l", "x"],
+        default="n",
+        help="Segmentation model size for bed detection: n, s, m, l, x.",
+    )
+    parser.add_argument(
+        "--seg-imgsz",
+        type=int,
+        default=640,
+        help="Segmentation model inference size for bed detection.",
     )
     known, unknown = parser.parse_known_args(raw_args)
 
@@ -648,6 +759,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         model_size="m",
         downsample=known.downsample,
         log_every=known.log_every,
+        seg_size=known.seg_size,
+        seg_imgsz=known.seg_imgsz,
     )
     dur = time.time() - start
     logger.info(f"Saved result video to: {out_path} (processed in {dur:.2f}s)")
