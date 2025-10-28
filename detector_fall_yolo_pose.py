@@ -3,6 +3,8 @@ import sys
 import math
 import time
 from typing import List, Tuple, Optional
+import argparse
+import logging
 
 import cv2
 import numpy as np
@@ -16,6 +18,48 @@ except Exception as exc:  # pragma: no cover
 
 ULTRA_ASSET_BASE = "https://github.com/ultralytics/assets/releases/download/v8.3.0"
 
+
+# -----------------------------
+# Logging
+# -----------------------------
+def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
+    level_norm = (level or "INFO").upper()
+    level_map = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
+    }
+    log_level = level_map.get(level_norm, logging.INFO)
+
+    logger = logging.getLogger("fall_detection")
+    logger.setLevel(log_level)
+
+    # Clear existing handlers to avoid duplication when re-running in notebooks/REPLs
+    if logger.handlers:
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    console = logging.StreamHandler()
+    console.setLevel(log_level)
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setLevel(log_level)
+            file_handler.setFormatter(fmt)
+            logger.addHandler(file_handler)
+        except Exception:
+            # Fall back to console-only if file can't be opened
+            logger.warning(f"Failed to open log file: {log_file}")
 
 # -----------------------------
 # Utility drawing functions
@@ -205,6 +249,12 @@ def compute_fall_score(points: np.ndarray, box_xyxy: Tuple[float, float, float, 
         orientation_change = abs(orientation_angle - prev_orientation)
         orientation_change_score = min(1.0, orientation_change / 45.0)  # 45 deg+ in one step is high
 
+    # Additional rule: wider-than-tall bbox (w/h > 0.6) increases fall likelihood
+    bbox_rule_bonus = 0.0
+    if bbox_ar > 0.6:
+        # Grows linearly from 0 when ar==0.6 up to a small cap
+        bbox_rule_bonus = min(0.5, max(0.0, (bbox_ar - 0.6) * 3))
+
     # Aggregate with weights
     weights = {
         "ar": 0.2,
@@ -220,6 +270,7 @@ def compute_fall_score(points: np.ndarray, box_xyxy: Tuple[float, float, float, 
         + weights["upper_horiz"] * upper_body_horizontal_score
         + weights["head_near_ankle"] * head_near_ankle
         + weights["orientation_change"] * orientation_change_score
+        + bbox_rule_bonus 
     )
 
     debug = {
@@ -231,6 +282,7 @@ def compute_fall_score(points: np.ndarray, box_xyxy: Tuple[float, float, float, 
         "orientation_score": orientation_score,
         "upper_body_horizontal_score": upper_body_horizontal_score,
         "orientation_change_score": orientation_change_score,
+        "bbox_rule_bonus": bbox_rule_bonus,
     }
     return max(0.0, min(1.0, score)), debug
 
@@ -324,19 +376,36 @@ def process_video(
     device: Optional[str] = None,
     show: bool = True,
     model_size: str = "n",
+    downsample: int = 1,
+    log_every: int = 30,
 ) -> str:
+    logger = logging.getLogger("fall_detection")
     ensure_dirs(weights_dir, results_dir)
     weights_path = locate_or_download_weights(weights_dir, model_size)
 
     model = YOLO(weights_path)
+    logger.info(f"Loaded model weights: {weights_path}")
 
     cap = cv2.VideoCapture(source_video_path)
     if not cap.isOpened():
+        logger.error(f"Cannot open video: {source_video_path}")
         raise FileNotFoundError(f"Cannot open video: {source_video_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    width_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    width = width_orig
+    height = height_orig
+    logger.info(f"Video opened: fps={fps:.2f}, size={width_orig}x{height_orig}, downsample={downsample}")
+
+    # Apply optional uniform downsampling (1=no downsample; 2=1/2; 3=1/3; 4=1/4)
+    if downsample is None:
+        downsample = 1
+    if downsample not in (1, 2, 3, 4):
+        downsample = 1
+    if downsample > 1:
+        width = max(1, int(round(width / downsample)))
+        height = max(1, int(round(height / downsample)))
 
     # Mirror path under results: results/<input_path_without_leading_dataset_dir>/<output_name>
     input_path_norm = source_video_path.replace("\\", "/")
@@ -354,6 +423,7 @@ def process_video(
         ext = os.path.splitext(source_video_path)[1] or ".mp4"
         output_name = f"{base}_fall_detected{ext}"
     out_path = os.path.join(out_folder, output_name)
+    logger.info(f"Output will be written to: {out_path}")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
@@ -365,6 +435,7 @@ def process_video(
     # Basic nearest-neighbor tracker by bbox center to keep IDs consistent frame-to-frame
     active_tracks = []  # list of (track_id, center_x, center_y)
     max_match_dist = max(20, int(0.05 * max(width, height)))
+    prev_falling_by_track = {}
 
     try:
         frame_index = 0
@@ -372,6 +443,10 @@ def process_video(
             ret, frame = cap.read()
             if not ret:
                 break
+
+            # Resize the frame if downsampling is enabled
+            if downsample > 1:
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
 
             results = model.predict(
                 source=frame,
@@ -387,6 +462,8 @@ def process_video(
             # Ultralytics returns a list of Results even for single image
             if not results:
                 writer.write(frame)
+                if log_every > 0 and (frame_index % max(1, log_every) == 0):
+                    logger.debug(f"frame={frame_index}: no model results")
                 frame_index += 1
                 continue
 
@@ -438,6 +515,7 @@ def process_video(
             active_tracks = updated_tracks
 
             # Render per detection
+            per_frame_fall_count = 0
             for i, box in enumerate(boxes):
                 tid = assigned[i]
                 kp = kps[i] if i < len(kps) else None
@@ -452,6 +530,21 @@ def process_video(
                 smoothed_score = smoother.smooth_score(tid, score)
 
                 falling = smoothed_score >= 0.6  # threshold tuned empirically
+                if falling:
+                    per_frame_fall_count += 1
+
+                # Fall state transitions per track
+                prev_state = prev_falling_by_track.get(tid, False)
+                if falling != prev_state:
+                    state_str = "FALL STARTED" if falling else "fall cleared"
+                    logger.info(
+                        f"frame={frame_index} track={tid} {state_str}: smoothed={smoothed_score:.2f}, "
+                        f"raw={score:.2f}, ar={debug.get('bbox_ar'):.2f}, ori={debug.get('orientation_angle') if debug.get('orientation_angle') is not None else 'nan'}, "
+                        f"upper_horiz={debug.get('upper_body_horiz_angle') if debug.get('upper_body_horiz_angle') is not None else 'nan'}, "
+                        f"scores={{ar:{debug.get('ar_score'):.2f}, ori:{debug.get('orientation_score'):.2f}, upper:{debug.get('upper_body_horizontal_score'):.2f}, "
+                        f"head:{debug.get('head_near_ankle'):.2f}, chg:{debug.get('orientation_change_score'):.2f}, bonus:{debug.get('bbox_rule_bonus'):.2f}}}"
+                    )
+                prev_falling_by_track[tid] = falling
 
                 color = (0, 255, 0) if not falling else (0, 0, 255)
                 x1i, y1i, x2i, y2i = xyxy_int(tuple(box.tolist()), width, height)
@@ -470,7 +563,19 @@ def process_video(
                     if ca >= 0.3 and cb >= 0.3:
                         cv2.line(frame, (xa, ya), (xb, yb), (0, 255, 255), 2)
 
+                # Periodic per-detection debug logs
+                if log_every > 0 and (frame_index % max(1, log_every) == 0):
+                    logger.debug(
+                        f"frame={frame_index} track={tid} det: box=({x1i},{y1i},{x2i},{y2i}) ar={debug.get('bbox_ar'):.2f} "
+                        f"raw={score:.2f} smoothed={smoothed_score:.2f} falling={falling}"
+                    )
+
             writer.write(frame)
+            # Periodic per-frame summary
+            if log_every > 0 and (frame_index % max(1, log_every) == 0):
+                logger.debug(
+                    f"frame={frame_index} summary: dets={len(boxes)}, falling={per_frame_fall_count}"
+                )
             if show:
                 cv2.imshow("Fall Detection (Pose)", frame)
                 if cv2.waitKey(1) & 0xFF == 27:  # ESC to exit
@@ -490,21 +595,62 @@ DEFAULT_INPUT = "./dataset/Le2i/Home_01/Home_01/Videos/video (1).avi"
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    args = sys.argv[1:] if argv is None else argv
-    if not args:
+    raw_args = sys.argv[1:] if argv is None else argv
+
+    parser = argparse.ArgumentParser(description="Fall detection with YOLO pose")
+    parser.add_argument(
+        "-ds", "--downsample",
+        type=int,
+        choices=[1, 2, 3, 4],
+        default=1,
+        help="Uniform downsampling factor: 1 (no downsample), 2 (1/2), 3 (1/3), 4 (1/4).",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL.",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Optional path to write logs to a file.",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=10,
+        help="Emit per-frame summary and per-detection debug logs every N frames (0=disable).",
+    )
+    known, unknown = parser.parse_known_args(raw_args)
+
+    if not unknown:
         inp = DEFAULT_INPUT
     else:
-        # Join remaining args to support paths with spaces (e.g., "video (1).avi")
-        inp = " ".join(args).strip()
+        # Join remaining tokens to support paths with spaces (e.g., "video (1).avi")
+        inp = " ".join(unknown).strip()
+
+    setup_logging(level=known.log_level, log_file=known.log_file)
+    logger = logging.getLogger("fall_detection")
 
     base_name = os.path.splitext(os.path.basename(inp))[0]
     out_name = f"{base_name}_fall_detected.avi"
 
     start = time.time()
     # You can change model_size to one of {"n","s","m","l"}
-    out_path = process_video(inp, weights_dir="weights", results_dir="results", output_name=out_name, show=True, model_size="s")
+    out_path = process_video(
+        inp,
+        weights_dir="weights",
+        results_dir="results",
+        output_name=out_name,
+        show=True,
+        model_size="m",
+        downsample=known.downsample,
+        log_every=known.log_every,
+    )
     dur = time.time() - start
-    print(f"Saved result video to: {out_path} (processed in {dur:.2f}s)")
+    logger.info(f"Saved result video to: {out_path} (processed in {dur:.2f}s)")
 
 
 if __name__ == "__main__":
