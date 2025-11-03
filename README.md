@@ -60,22 +60,22 @@ python main.py \
 - **log-every**: debug frequency in frames (0 disables)
 - **seg-size**: bed segmentation model size: n | s | m | l | x
 - **seg-imgsz**: segmentation inference size
-- **lie-threshold**: on-bed distance阈值，范围 [0,1]，表示 `阈值像素 = 值 * 图像宽度`。值越大，越容易被判定为 on bed（默认 0.2）。
-- **bed-center-offset**: 手动修正床区中心（B 点）的偏移，单位像素，格式 `DX DY`，默认 `0 0`。正值向右/向下，负值向左/向上。应用后自动裁剪在图像范围内。
-- **visual-center**: 开启后在结果视频上显示 A（人体中心）与 B（床中心）两点；不加该开关则不显示。
+- **lie-threshold**: On-bed distance threshold in [0,1]. Pixel threshold = value x image width. Larger values make On Bed more likely (default 0.2).
+- **bed-center-offset**: Manual correction for B (bed center), in pixels as `DX DY`. Default `0 0`. Positive moves right/down; negative moves left/up. Clipped to image bounds.
+- **visual-center**: When set, shows A (person center) and B (bed center), and overlays the bed mask. Otherwise these visuals are hidden.
 
-### On Bed 判定规则（三条件合一）
-- **A 点**: 人体检测框的中心点。
-- **B 点**: 床区 mask 的外接矩形框中心点（仅在首帧分割时计算），再加上 `bed-center-offset (DX,DY)` 偏移，并裁剪到图像范围内。A/B 的可视化受 `--visual-center` 控制。
-- 当人物处于“falling”姿态，且同时满足以下三条时，判定为 **On Bed**，否则为 **Falling**：
-  1) `dist(A,B) < lie_threshold * 图像宽度`
-  2) `|person_y2 - bed_y2| < lie_threshold * 图像高度`
-  3) `交叠面积 / 人体bbox面积 ≥ 70%`
-  结果视频可在启用 `--visual-center` 时显示 A（黄）与 B（品红）。
+### On-bed decision (three conditions)
+- **A (person center)**: center of the person detection bounding box.
+- **B (bed center)**: center of the bed mask bounding box (computed on the first frame), then shifted by `bed-center-offset (DX DY)` and clipped to image bounds. Visualization of A/B and the bed mask is controlled by `--visual-center`.
+- When the person is in the "falling" posture, classify as On Bed only if ALL of the following are true:
+  1) `dist(A, B) < lie_threshold * image_width`
+  2) `|person_y2 - bed_y2| < lie_threshold * image_height`
+  3) `overlap_area / person_bbox_area ≥ 0.70`
+  A is drawn in yellow and B in magenta when `--visual-center` is enabled.
 
-示例：将 B 点向右下各偏移 100 像素
+Example: shift B by +100 px on x and y (bottom-right) and show centers
 ```bash
-python main.py "./dataset/Real/fall/video1.mp4" --lie-threshold 0.25 --bed-center-offset 100 100
+python main.py "./dataset/Real/fall/video1.mp4" --lie-threshold 0.25 --bed-center-offset 100 100 --visual-center
 ```
 
 Model size for pose (n|s|m|l) is set inside `main.py` when calling `process_video` and can be adjusted if needed.
