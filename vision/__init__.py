@@ -1,2 +1,0 @@
-# Marker for vision package
-
