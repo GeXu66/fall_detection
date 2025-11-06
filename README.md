@@ -26,7 +26,7 @@ pip install ultralytics opencv-python numpy
 ## Run
 Use the new entrypoint. If the video path contains spaces, wrap it in quotes.
 ```bash
-python main.py "./dataset/Le2i/Home_01/Home_01/Videos/video (1).avi"
+python main.py -ds 4 --bed-center-offset 0 -60 "./dataset/Real/fall/video1.mp4"
 ```
 Or omit the argument to use the default input:
 ```bash
@@ -47,12 +47,14 @@ python main.py \
   --log-level INFO \
   --log-file run.log \
   --log-every 30 \
-  --seg-size n \
-  --seg-imgsz 640 \
-  --lie-threshold 0.2 \
-  --bed-center-offset 0 0 \
+  --bed-center-offset 0 -50 \
   --visual-center \
-  "./dataset/Le2i/Home_01/Home_01/Videos/video (1).avi"
+  --visual-mask \
+  --seg-size s \
+  --seg-imgsz 640 \
+  --bed-center-box-w-scale 0.8 \
+  --bed-center-box-h-scale 0.7 \
+  "./dataset/Real/fall/video1.mp4"
 ```
 - **downsample**: 1 (no DS) ... 8 (1/8)
 - **log-level**: DEBUG | INFO | WARNING | ERROR | CRITICAL
@@ -60,17 +62,17 @@ python main.py \
 - **log-every**: debug frequency in frames (0 disables)
 - **seg-size**: bed segmentation model size: n | s | m | l | x
 - **seg-imgsz**: segmentation inference size
-- **lie-threshold**: On-bed distance threshold in [0,1]. Pixel threshold = value x image width. Larger values make On Bed more likely (default 0.2).
-- **bed-center-offset**: Manual correction for B (bed center), in pixels as `DX DY`. Default `0 0`. Positive moves right/down; negative moves left/up. Clipped to image bounds.
-- **visual-center**: When set, shows A (person center) and B (bed center), and overlays the bed mask. Otherwise these visuals are hidden.
+- **bed-center-offset**: Manual correction for B (bed center), in pixels as `DX DY`. Default `0 -60`. Positive moves right/down; negative moves left/up. Clipped to image bounds.
+- **visual-center**: When set, shows A (person center) and B (bed center).
+- **visual-mask**: Overlay the bed mask on frames.
+- **bed-center-box-w-scale / -h-scale**: Size of the B-centered rectangle as a fraction of the bed bbox width/height (default 0.8 / 0.7).
 
-### On-bed decision (three conditions)
+### On-bed decision (two conditions)
 - **A (person center)**: center of the person detection bounding box.
 - **B (bed center)**: center of the bed mask bounding box (computed on the first frame), then shifted by `bed-center-offset (DX DY)` and clipped to image bounds. Visualization of A/B and the bed mask is controlled by `--visual-center`.
-- When the person is in the "falling" posture, classify as On Bed only if ALL of the following are true:
-  1) `dist(A, B) < lie_threshold * image_width`
-  2) `|person_y2 - bed_y2| < lie_threshold * image_height`
-  3) `overlap_area / person_bbox_area ≥ 0.70`
+- When the person is in a falling posture, classify as On Bed only if BOTH are true:
+  1) A lies inside the B-centered rectangle, whose size is controlled by `--bed-center-box-w-scale` and `--bed-center-box-h-scale`.
+  2) `overlap_area / person_bbox_area ≥ 0.60`.
   A is drawn in yellow and B in magenta when `--visual-center` is enabled.
 
 Example: shift B by +100 px on x and y (bottom-right) and show centers

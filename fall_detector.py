@@ -82,9 +82,11 @@ def process_video(
     log_every: int = 30,
     seg_size: str = "n",
     seg_imgsz: int = 640,
-    lie_threshold: float = 0.2,
     bed_center_offset: Tuple[int, int] = (0, 0),
     visual_center: bool = False,
+    visual_mask: bool = False,
+    bed_center_box_w_scale: float = 0.8,
+    bed_center_box_h_scale: float = 0.7,
 ) -> str:
     logger = logging.getLogger("fall_detection")
     ensure_dirs(weights_dir, results_dir)
@@ -112,6 +114,7 @@ def process_video(
     width = width_orig
     height = height_orig
     logger.info(f"Video opened: fps={fps:.2f}, size={width_orig}x{height_orig}, downsample={downsample}")
+    log_sec_interval = max(1, int(round(fps)))
 
     # Apply optional uniform downsampling (1=no downsample; 2=1/2; 3=1/3; 4=1/4)
     if downsample is None:
@@ -145,13 +148,6 @@ def process_video(
     if not writer.isOpened():
         raise RuntimeError("Failed to open VideoWriter. Check codec availability.")
 
-    # Clamp lie_threshold to [0, 1]
-    try:
-        lie_threshold = float(lie_threshold)
-    except Exception:
-        lie_threshold = 0.2
-    lie_threshold = max(0.0, min(1.0, lie_threshold))
-
     # Normalize bed_center_offset to two ints
     try:
         if isinstance(bed_center_offset, (list, tuple)) and len(bed_center_offset) >= 2:
@@ -168,6 +164,8 @@ def process_video(
     active_tracks = []  # list of (track_id, center_x, center_y)
     max_match_dist = max(20, int(0.05 * max(width, height)))
     prev_falling_by_track = {}
+    prev_may_by_track = {}
+    may_streak_frames_by_track = {}
 
     try:
         frame_index = 0
@@ -200,28 +198,38 @@ def process_video(
                 except Exception as exc:
                     logger.warning(f"Bed segmentation failed: {exc}")
 
-            # Overlay bed mask if available
-            # Only visualize bed mask and B when visual_center is enabled
-            if bed_mask is not None and visual_center:
+            # Overlay bed mask if requested
+            if bed_mask is not None and visual_mask:
                 overlay_mask(frame, bed_mask, color=(255, 0, 0), alpha=0.25)
-                # Draw B point only if visualization is enabled
-                if bed_bbox is not None:
-                    bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox
-                    bx = int((bed_x1 + bed_x2) * 0.5) + bed_dx
-                    by = int((bed_y1 + bed_y2) * 0.5) + bed_dy
-                    bx = max(0, min(bx, width - 1))
-                    by = max(0, min(by, height - 1))
-                    cv2.circle(frame, (bx, by), 6, (255, 0, 255), -1)
-                    cv2.putText(
-                        frame,
-                        "B",
-                        (bx + 6, max(0, by - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 0, 255),
-                        2,
-                        lineType=cv2.LINE_AA,
-                    )
+
+            # Draw B point and small B-centered rectangle if requested
+            if bed_bbox is not None and visual_center:
+                bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox
+                bx = int((bed_x1 + bed_x2) * 0.5) + bed_dx
+                by = int((bed_y1 + bed_y2) * 0.5) + bed_dy
+                bx = max(0, min(bx, width - 1))
+                by = max(0, min(by, height - 1))
+                cv2.circle(frame, (bx, by), 6, (255, 0, 255), -1)
+                cv2.putText(
+                    frame,
+                    "B",
+                    (bx + 6, max(0, by - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 0, 255),
+                    2,
+                    lineType=cv2.LINE_AA,
+                )
+                # Draw small bed-centered bbox (visual aid)
+                bed_w = max(1, bed_x2 - bed_x1)
+                bed_h = max(1, bed_y2 - bed_y1)
+                half_w = int(0.5 * bed_w * float(bed_center_box_w_scale))
+                half_h = int(0.5 * bed_h * float(bed_center_box_h_scale))
+                rx1 = max(0, min(bx - half_w, width - 1))
+                ry1 = max(0, min(by - half_h, height - 1))
+                rx2 = max(0, min(bx + half_w, width - 1))
+                ry2 = max(0, min(by + half_h, height - 1))
+                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (180, 0, 180), 2)
 
             results = model.predict(
                 source=frame,
@@ -298,6 +306,36 @@ def process_video(
                 if kp is None:
                     continue
 
+                # If too few reliable keypoints, mark as Image Incomplete and skip fall logic
+                try:
+                    valid_kp_count = int(np.sum(kp[:, 2] >= 0.3))
+                except Exception:
+                    valid_kp_count = 0
+                min_kp_required = 6
+                if valid_kp_count < min_kp_required:
+                    x1i, y1i, x2i, y2i = xyxy_int(tuple(box.tolist()), width, height)
+                    ax = int((x1i + x2i) * 0.5)
+                    ay = int((y1i + y2i) * 0.5)
+                    if visual_center:
+                        cv2.circle(frame, (ax, ay), 5, (0, 255, 255), -1)
+                        cv2.putText(
+                            frame,
+                            "A",
+                            (ax + 6, max(0, ay - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 255, 255),
+                            2,
+                            lineType=cv2.LINE_AA,
+                        )
+                    draw_rounded_rectangle(frame, (x1i, y1i), (x2i, y2i), (128, 128, 128), thickness=3, radius=12)
+                    put_label_above_box(frame, "Image Incomplete", (x1i, y1i, x2i, y2i), (255, 255, 255))
+                    if log_every > 0 and (frame_index % max(1, log_every) == 0):
+                        logger.debug(
+                            f"frame={frame_index} track={tid} image_incomplete: valid_kp={valid_kp_count} < {min_kp_required}"
+                        )
+                    continue
+
                 prev_orientation = smoother.get_prev_orientation(tid)
                 score, debug = compute_fall_score(kp, tuple(box.tolist()), prev_orientation)
 
@@ -305,7 +343,144 @@ def process_video(
                 smoother.set_orientation(tid, debug.get("orientation_angle"))
                 smoothed_score = smoother.smooth_score(tid, score)
 
-                falling = smoothed_score >= 0.6  # threshold tuned empirically
+                # Base rule from score -> may fall
+                may_fall_base = smoothed_score >= 0.6  # threshold tuned empirically
+
+                # New rule: ankle above hip AND hip above shoulder implies may fall
+                ankle_over_hip_and_hip_over_shoulder = False
+                try:
+                    ls = COCO_KP_NAMES.index("left_shoulder")
+                    lh = COCO_KP_NAMES.index("left_hip")
+                    la = COCO_KP_NAMES.index("left_ankle")
+                    rs = COCO_KP_NAMES.index("right_shoulder")
+                    rh = COCO_KP_NAMES.index("right_hip")
+                    ra = COCO_KP_NAMES.index("right_ankle")
+
+                    def side_inverted(s, h, a):
+                        if float(kp[s][2]) < 0.3 or float(kp[h][2]) < 0.3 or float(kp[a][2]) < 0.3:
+                            return False
+                        y_s = float(kp[s][1])
+                        y_h = float(kp[h][1])
+                        y_a = float(kp[a][1])
+                        box_h_local = max(1.0, float(box[3] - box[1]))
+                        margin_px = 0.02 * box_h_local
+                        return (y_a + margin_px) < y_h and (y_h + margin_px) < y_s
+
+                    ankle_over_hip_and_hip_over_shoulder = side_inverted(ls, lh, la) or side_inverted(rs, rh, ra)
+                except Exception:
+                    ankle_over_hip_and_hip_over_shoulder = False
+
+                # New NO-FALL rule: shoulder midpoint below hip midpoint but above lowest ankle midpoint
+                no_fall_by_shoulder_between = False
+                try:
+                    ls_idx = COCO_KP_NAMES.index("left_shoulder")
+                    rs_idx = COCO_KP_NAMES.index("right_shoulder")
+                    lh_idx = COCO_KP_NAMES.index("left_hip")
+                    rh_idx = COCO_KP_NAMES.index("right_hip")
+                    la_idx = COCO_KP_NAMES.index("left_ankle")
+                    ra_idx = COCO_KP_NAMES.index("right_ankle")
+
+                    s_ys = [float(kp[idx][1]) for idx in (ls_idx, rs_idx) if float(kp[idx][2]) >= 0.3]
+                    h_ys = [float(kp[idx][1]) for idx in (lh_idx, rh_idx) if float(kp[idx][2]) >= 0.3]
+                    a_ys = [float(kp[idx][1]) for idx in (la_idx, ra_idx) if float(kp[idx][2]) >= 0.3]
+
+                    if s_ys and h_ys and a_ys:
+                        shoulder_mid_y = sum(s_ys) / len(s_ys)
+                        hip_mid_y = sum(h_ys) / len(h_ys)
+                        ankle_lowest_y = max(a_ys)  # lowest point in image has largest y
+                        if (shoulder_mid_y > hip_mid_y) and (shoulder_mid_y < ankle_lowest_y):
+                            no_fall_by_shoulder_between = True
+                except Exception:
+                    no_fall_by_shoulder_between = False
+
+
+
+                # New NO-FALL rule: angle(hip->shoulder, hip->knee) < 45 deg AND wrist-ankle distance is small
+                no_fall_by_angle_and_wrist_ankle = False
+                try:
+                    # Left side
+                    ls = COCO_KP_NAMES.index("left_shoulder")
+                    lh = COCO_KP_NAMES.index("left_hip")
+                    lk = COCO_KP_NAMES.index("left_knee")
+                    lw = COCO_KP_NAMES.index("left_wrist")
+                    la = COCO_KP_NAMES.index("left_ankle")
+                    # Right side
+                    rs = COCO_KP_NAMES.index("right_shoulder")
+                    rh = COCO_KP_NAMES.index("right_hip")
+                    rk = COCO_KP_NAMES.index("right_knee")
+                    rw = COCO_KP_NAMES.index("right_wrist")
+                    ra = COCO_KP_NAMES.index("right_ankle")
+
+                    def side_ok(s, h, k, w_, a_):
+                        if float(kp[s][2]) < 0.3 or float(kp[h][2]) < 0.3 or float(kp[k][2]) < 0.3 or float(kp[w_][2]) < 0.3 or float(kp[a_][2]) < 0.3:
+                            return False
+                        vx1 = float(kp[s][0]) - float(kp[h][0])
+                        vy1 = float(kp[s][1]) - float(kp[h][1])
+                        vx2 = float(kp[k][0]) - float(kp[h][0])
+                        vy2 = float(kp[k][1]) - float(kp[h][1])
+                        n1 = math.hypot(vx1, vy1)
+                        n2 = math.hypot(vx2, vy2)
+                        if n1 <= 1e-6 or n2 <= 1e-6:
+                            return False
+                        cosang = max(-1.0, min(1.0, (vx1 * vx2 + vy1 * vy2) / (n1 * n2)))
+                        ang = math.degrees(math.acos(cosang))
+                        # wrist-ankle distance threshold relative to person bbox height
+                        dist = math.hypot(float(kp[w_][0]) - float(kp[a_][0]), float(kp[w_][1]) - float(kp[a_][1]))
+                        box_h_local = max(1.0, float(box[3] - box[1]))
+                        close_thr = 0.25 * box_h_local
+                        return (ang < 90.0) and (dist <= close_thr)
+
+                    no_fall_by_angle_and_wrist_ankle = side_ok(ls, lh, lk, lw, la) or side_ok(rs, rh, rk, rw, ra)
+                except Exception:
+                    no_fall_by_angle_and_wrist_ankle = False
+
+                if ankle_over_hip_and_hip_over_shoulder:
+                    # Give priority: this posture implies May fall regardless of no-fall suppressors
+                    may_fall = True
+                else:
+                    # Otherwise, apply suppressors to the base score rule
+                    may_fall = may_fall_base and (not no_fall_by_shoulder_between) and (not no_fall_by_angle_and_wrist_ankle)
+
+                # Prepare A point and an early on-bed check to suppress escalation while on bed
+                x1i, y1i, x2i, y2i = xyxy_int(tuple(box.tolist()), width, height)
+                ax = int((x1i + x2i) * 0.5)
+                ay = int((y1i + y2i) * 0.5)
+
+                on_bed_for_escalation = False
+                if may_fall and bed_bbox is not None:
+                    bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox
+                    bx_tmp = int((bed_x1 + bed_x2) * 0.5) + bed_dx
+                    by_tmp = int((bed_y1 + bed_y2) * 0.5) + bed_dy
+                    bx_tmp = max(0, min(bx_tmp, width - 1))
+                    by_tmp = max(0, min(by_tmp, height - 1))
+                    bed_w_tmp = max(1, bed_x2 - bed_x1)
+                    bed_h_tmp = max(1, bed_y2 - bed_y1)
+                    half_w_tmp = 0.5 * bed_w_tmp * float(bed_center_box_w_scale)
+                    half_h_tmp = 0.5 * bed_h_tmp * float(bed_center_box_h_scale)
+                    center_ok_tmp = (abs(float(ax) - float(bx_tmp)) <= half_w_tmp) and (abs(float(ay) - float(by_tmp)) <= half_h_tmp)
+                    inter_x1 = max(x1i, bed_x1)
+                    inter_y1 = max(y1i, bed_y1)
+                    inter_x2 = min(x2i, bed_x2)
+                    inter_y2 = min(y2i, bed_y2)
+                    inter_area = 0.0
+                    if inter_x2 > inter_x1 and inter_y2 > inter_y1:
+                        inter_area = float((inter_x2 - inter_x1) * (inter_y2 - inter_y1))
+                    person_area = float(max(1, (x2i - x1i) * (y2i - y1i)))
+                    overlap_ratio_tmp = inter_area / person_area
+                    overlap_ok_tmp = overlap_ratio_tmp >= 0.6
+                    on_bed_for_escalation = center_ok_tmp and overlap_ok_tmp
+
+                # May fall streak for escalation (ignore on-bed frames)
+                if may_fall and not on_bed_for_escalation:
+                    streak = may_streak_frames_by_track.get(tid, 0) + 1
+                    may_streak_frames_by_track[tid] = streak
+                else:
+                    may_streak_frames_by_track[tid] = 0
+
+                # Escalation: continuous 3s of May fall
+                needed_frames = int(round(3 * fps))
+                escalate_by_streak = may_streak_frames_by_track.get(tid, 0) >= needed_frames
+                falling = escalate_by_streak
                 if falling:
                     per_frame_fall_count += 1
 
@@ -321,8 +496,10 @@ def process_video(
                         f"head:{debug.get('head_near_ankle'):.2f}, chg:{debug.get('orientation_change_score'):.2f}, bonus:{debug.get('bbox_rule_bonus'):.2f}}}"
                     )
                 prev_falling_by_track[tid] = falling
+                prev_may_by_track[tid] = may_fall
 
-                color = (0, 255, 0) if not falling else (0, 0, 255)
+                # Colors: No Falling -> green, May Fall -> orange, Falling -> red, On Bed -> blue (set later)
+                color = (0, 255, 0)
                 x1i, y1i, x2i, y2i = xyxy_int(tuple(box.tolist()), width, height)
                 # Compute A point (center of person bbox) and draw only if visualization is enabled
                 ax = int((x1i + x2i) * 0.5)
@@ -341,23 +518,22 @@ def process_video(
                     )
                 # Classify On Bed vs Falling if bed mask exists and falling posture detected
                 status_text = "No Falling"
-                if falling and bed_bbox is not None:
+                if may_fall and bed_bbox is not None:
                     bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox
-                    # Rule 1: center distance threshold (width-scaled)
+                    # Rule 1: center-in-rectangle check (rectangle centered at B)
                     bx = int((bed_x1 + bed_x2) * 0.5) + bed_dx
                     by = int((bed_y1 + bed_y2) * 0.5) + bed_dy
                     bx = max(0, min(bx, width - 1))
                     by = max(0, min(by, height - 1))
-                    dist_px = math.hypot(float(ax - bx), float(ay - by))
-                    center_thresh_px = lie_threshold * float(width)
-                    center_ok = dist_px <= center_thresh_px
+                    bed_w = max(1, bed_x2 - bed_x1)
+                    bed_h = max(1, bed_y2 - bed_y1)
+                    half_w = 0.5 * bed_w * float(bed_center_box_w_scale)
+                    half_h = 0.5 * bed_h * float(bed_center_box_h_scale)
+                    center_dx = abs(float(ax) - float(bx))
+                    center_dy = abs(float(ay) - float(by))
+                    center_ok = (center_dx <= half_w) and (center_dy <= half_h)
 
-                    # Rule 2: bottom-edge y distance threshold (height-scaled)
-                    bottom_diff_px = float(abs(y2i - bed_y2))
-                    bottom_thresh_px = lie_threshold * float(height)
-                    bottom_ok = bottom_diff_px <= bottom_thresh_px
-
-                    # Rule 3: bbox overlap area covers at least 70% of person bbox area
+                    # Rule 2: bbox overlap area covers at least 70% of person bbox area
                     inter_x1 = max(x1i, bed_x1)
                     inter_y1 = max(y1i, bed_y1)
                     inter_x2 = min(x2i, bed_x2)
@@ -367,23 +543,40 @@ def process_video(
                         inter_area = float((inter_x2 - inter_x1) * (inter_y2 - inter_y1))
                     person_area = float(max(1, (x2i - x1i) * (y2i - y1i)))
                     overlap_ratio = inter_area / person_area
-                    overlap_ok = overlap_ratio >= 0.7
+                    overlap_threshold = 0.6
+                    overlap_ok = overlap_ratio >= overlap_threshold
 
-                    on_bed = center_ok and bottom_ok and overlap_ok
+                    on_bed = center_ok and overlap_ok
                     if on_bed:
                         status_text = "On Bed"
                         color = (255, 0, 0)
                     else:
-                        status_text = "Falling"
+                        if falling:
+                            status_text = "Falling"
+                            color = (0, 0, 255)
+                        else:
+                            status_text = "May Fall"
+                            color = (0, 165, 255)
                     if log_every > 0 and (frame_index % max(1, log_every) == 0):
                         logger.debug(
-                            f"frame={frame_index} track={tid} bed_check(3-rule): "
-                            f"center={center_ok} (dist={dist_px:.1f} <= {center_thresh_px:.1f}), "
-                            f"bottom={bottom_ok} (|py2-bed_y2|={bottom_diff_px:.1f} <= {bottom_thresh_px:.1f}), "
-                            f"overlap={overlap_ok} (ratio={overlap_ratio:.2f} >= 0.70) -> {status_text}"
+                            f"frame={frame_index} track={tid} may_fall bed_check(2-rule): "
+                            f"center_rect={center_ok} (|dx|={center_dx:.1f}<={half_w:.1f}, |dy|={center_dy:.1f}<={half_h:.1f}), "
+                            f"overlap={overlap_ok} (ratio={overlap_ratio:.2f} >= {overlap_threshold}) -> {status_text}"
+                        )
+
+                    # Per-second INFO log while may-fall: expose two-rule satisfaction and escalation by streak only
+                    if (frame_index % log_sec_interval == 0):
+                        logger.info(
+                            f"frame={frame_index} track={tid} may_fall: center_rect={center_ok} "
+                            f"(dx={center_dx:.1f}/{half_w:.1f}, dy={center_dy:.1f}/{half_h:.1f}), "
+                            f"overlap={overlap_ok} (ratio={overlap_ratio:.2f}/{overlap_threshold}), "
+                            f"escalate(streak={may_streak_frames_by_track.get(tid, 0)}/{needed_frames}) => {status_text}"
                         )
                 else:
+                    # not may fall
                     status_text = "Falling" if falling else "No Falling"
+                    if falling:
+                        color = (0, 0, 255)
 
                 draw_rounded_rectangle(frame, (x1i, y1i), (x2i, y2i), color, thickness=3, radius=12)
                 put_label_above_box(frame, status_text, (x1i, y1i, x2i, y2i), (255, 255, 255))
@@ -403,7 +596,7 @@ def process_video(
                 if log_every > 0 and (frame_index % max(1, log_every) == 0):
                     logger.debug(
                         f"frame={frame_index} track={tid} det: box=({x1i},{y1i},{x2i},{y2i}) ar={debug.get('bbox_ar'):.2f} "
-                        f"raw={score:.2f} smoothed={smoothed_score:.2f} falling={falling}"
+                        f"raw={score:.2f} smoothed={smoothed_score:.2f} falling={falling} ankle_hip_shoulder_inv={ankle_over_hip_and_hip_over_shoulder}"
                     )
 
             writer.write(frame)

@@ -45,7 +45,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--seg-size",
         type=str,
         choices=["n", "s", "m", "l", "x"],
-        default="n",
+        default="s",
         help="Segmentation model size for bed detection: n, s, m, l, x.",
     )
     parser.add_argument(
@@ -59,19 +59,30 @@ def main(argv: Optional[List[str]] = None) -> None:
         nargs=2,
         type=int,
         metavar=("DX", "DY"),
-        default=[0, 0],
+        default=[0, -60],
         help="Manual offset (pixels) added to bed center: DX DY. Clipped to image bounds.",
     )
     parser.add_argument(
         "--visual-center",
         action="store_true",
-        help="If set, visualize A (person) and B (bed) centers on output frames.",
+        help="If set, visualize A/B centers and the small B-centered rectangle.",
     )
     parser.add_argument(
-        "--lie-threshold",
+        "--visual-mask",
+        action="store_true",
+        help="If set, overlay the detected bed mask on output frames.",
+    )
+    parser.add_argument(
+        "--bed-center-box-w-scale",
         type=float,
-        default=0.4,
-        help="On-bed distance threshold in [0,1] as a fraction of image width. Larger => easier to be classified on bed.",
+        default=0.8,
+        help="Width scale for small bed-centered bbox (fraction of bed bbox width).",
+    )
+    parser.add_argument(
+        "--bed-center-box-h-scale",
+        type=float,
+        default=0.7,
+        help="Height scale for small bed-centered bbox (fraction of bed bbox height).",
     )
     known, unknown = parser.parse_known_args(raw_args)
 
@@ -100,9 +111,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         log_every=known.log_every,
         seg_size=known.seg_size,
         seg_imgsz=known.seg_imgsz,
-        lie_threshold=known.lie_threshold,
         bed_center_offset=tuple(known.bed_center_offset),
         visual_center=known.visual_center,
+        visual_mask=known.visual_mask,
+        bed_center_box_w_scale=known.bed_center_box_w_scale,
+        bed_center_box_h_scale=known.bed_center_box_h_scale,
     )
     dur = time.time() - start
     logger.info(f"Saved result video to: {out_path} (processed in {dur:.2f}s)")
