@@ -59,7 +59,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         nargs=2,
         type=int,
         metavar=("DX", "DY"),
-        default=[0, -60],
+        default=[20, -30],
         help="Manual offset (pixels) added to bed center: DX DY. Clipped to image bounds.",
     )
     parser.add_argument(
@@ -81,7 +81,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument(
         "--bed-center-box-h-scale",
         type=float,
-        default=0.7,
+        default=0.6,
         help="Height scale for small bed-centered bbox (fraction of bed bbox height).",
     )
     known, unknown = parser.parse_known_args(raw_args)

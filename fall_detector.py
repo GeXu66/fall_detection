@@ -95,6 +95,41 @@ def process_video(
     model = YOLO(weights_path)
     logger.info(f"Loaded model weights: {weights_path}")
 
+    def scale_bbox_to_frame(
+        bbox: Optional[Tuple[int, int, int, int]],
+        src_size: Optional[Tuple[int, int]],
+        dst_size: Tuple[int, int],
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Scale a bbox defined on src_size into dst_size coordinates."""
+        if bbox is None:
+            return None
+        if not src_size or not dst_size:
+            return bbox
+        src_w, src_h = src_size
+        dst_w, dst_h = dst_size
+        if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
+            return bbox
+        if src_w == dst_w and src_h == dst_h:
+            return bbox
+        sx = dst_w / float(src_w)
+        sy = dst_h / float(src_h)
+        x1, y1, x2, y2 = bbox
+        scaled = (
+            int(round(x1 * sx)),
+            int(round(y1 * sy)),
+            int(round(x2 * sx)),
+            int(round(y2 * sy)),
+        )
+        x1s = max(0, min(scaled[0], dst_w - 1))
+        y1s = max(0, min(scaled[1], dst_h - 1))
+        x2s = max(0, min(scaled[2], dst_w - 1))
+        y2s = max(0, min(scaled[3], dst_h - 1))
+        if x2s < x1s:
+            x1s, x2s = x2s, x1s
+        if y2s < y1s:
+            y1s, y2s = y2s, y1s
+        return (x1s, y1s, x2s, y2s)
+
     # Load segmentation model once (for bed detection)
     seg_model = None
     try:
@@ -171,7 +206,34 @@ def process_video(
         frame_index = 0
         bed_mask = None
         bed_bbox = None  # (x1, y1, x2, y2) in frame coordinates
+        bed_bbox_frame_size: Optional[Tuple[int, int]] = None
+        paused = False
+        last_display_frame = None
         while True:
+            if paused:
+                if show and last_display_frame is not None:
+                    paused_frame = last_display_frame.copy()
+                    cv2.putText(
+                        paused_frame,
+                        "Paused - press Q to resume",
+                        (15, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 255),
+                        2,
+                        lineType=cv2.LINE_AA,
+                    )
+                    cv2.imshow("Fall Detection (Pose)", paused_frame)
+                    key = cv2.waitKey(100) & 0xFF
+                    if key == 27:
+                        break
+                    if key in (ord('q'), ord('Q')):
+                        paused = False
+                        logger.info("Resumed playback. Press 'q' to pause again or ESC to exit.")
+                        continue
+                else:
+                    paused = False
+                continue
             ret, frame = cap.read()
             if not ret:
                 break
@@ -179,6 +241,8 @@ def process_video(
             # Resize the frame if downsampling is enabled
             if downsample > 1:
                 frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+            frame_h, frame_w = frame.shape[:2]
 
             # On the very first frame (after any resizing), run bed segmentation once
             if frame_index == 0 and seg_model is not None and bed_mask is None:
@@ -189,22 +253,35 @@ def process_video(
                         ys, xs = np.where(bed_mask > 0)
                         if xs.size > 0 and ys.size > 0:
                             bed_bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+                            bed_bbox_frame_size = (frame_w, frame_h)
                             logger.info(f"Bed mask detected on first frame. bbox={bed_bbox}")
                         else:
                             bed_bbox = None
+                            bed_bbox_frame_size = None
                             logger.info("Bed mask detected on first frame, but empty area.")
                     else:
                         logger.info("No bed detected on first frame.")
                 except Exception as exc:
                     logger.warning(f"Bed segmentation failed: {exc}")
+                    bed_mask = None
+                    bed_bbox = None
+                    bed_bbox_frame_size = None
+
+            bed_bbox_current = None
+            if bed_bbox is not None:
+                bed_bbox_current = scale_bbox_to_frame(
+                    bed_bbox,
+                    bed_bbox_frame_size,
+                    (frame_w, frame_h),
+                )
 
             # Overlay bed mask if requested
             if bed_mask is not None and visual_mask:
                 overlay_mask(frame, bed_mask, color=(255, 0, 0), alpha=0.25)
 
             # Draw B point and small B-centered rectangle if requested
-            if bed_bbox is not None and visual_center:
-                bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox
+            if bed_bbox_current is not None and visual_center:
+                bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox_current
                 bx = int((bed_x1 + bed_x2) * 0.5) + bed_dx
                 by = int((bed_y1 + bed_y2) * 0.5) + bed_dy
                 bx = max(0, min(bx, width - 1))
@@ -247,6 +324,7 @@ def process_video(
                 writer.write(frame)
                 if log_every > 0 and (frame_index % max(1, log_every) == 0):
                     logger.debug(f"frame={frame_index}: no model results")
+                last_display_frame = frame
                 frame_index += 1
                 continue
 
@@ -408,16 +486,18 @@ def process_video(
                         if ang_ab_r is not None and ang_bc_r is not None:
                             if (ang_ab_r < 90.0) and (ang_bc_r < 90.0):
                                 right_ok = True
-                    # if frame_index % 25 == 0:
-                    #     print('--------------------------------')
-                    #     print('angle_ab', ang_ab)
-                    #     print('angle_bc', ang_bc)
-                    #     print('angle_ab_r', ang_ab_r)
-                    #     print('angle_bc_r', ang_bc_r)
-                    #     print('left_ok', left_ok)
-                    #     print('right_ok', right_ok)
+
 
                     no_fall_by_cleaning_floor = left_ok or right_ok
+                    if no_fall_by_cleaning_floor:
+                        if frame_index % 25 == 0:
+                            print('--------------------------------')
+                            print('angle_ab', ang_ab)
+                            print('angle_bc', ang_bc)
+                            print('angle_ab_r', ang_ab_r)
+                            print('angle_bc_r', ang_bc_r)
+                            print('left_ok', left_ok)
+                            print('right_ok', right_ok)
                 except Exception:
                     no_fall_by_cleaning_floor = False
 
@@ -548,8 +628,8 @@ def process_video(
                 ay = int((y1i + y2i) * 0.5)
 
                 on_bed_for_escalation = False
-                if may_fall and bed_bbox is not None:
-                    bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox
+                if may_fall and bed_bbox_current is not None:
+                    bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox_current
                     bx_tmp = int((bed_x1 + bed_x2) * 0.5) + bed_dx
                     by_tmp = int((bed_y1 + bed_y2) * 0.5) + bed_dy
                     bx_tmp = max(0, min(bx_tmp, width - 1))
@@ -619,8 +699,16 @@ def process_video(
                     )
                 # Classify On Bed vs Falling if bed mask exists and falling posture detected
                 status_text = "No Falling"
-                if may_fall and bed_bbox is not None:
-                    bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox
+                center_ok = None
+                overlap_ok = None
+                overlap_ratio = None
+                center_dx = None
+                center_dy = None
+                half_w = None
+                half_h = None
+                on_bed = False
+                if may_fall and bed_bbox_current is not None:
+                    bed_x1, bed_y1, bed_x2, bed_y2 = bed_bbox_current
                     # Rule 1: center-in-rectangle check (rectangle centered at B)
                     bx = int((bed_x1 + bed_x2) * 0.5) + bed_dx
                     by = int((bed_y1 + bed_y2) * 0.5) + bed_dy
@@ -664,20 +752,38 @@ def process_video(
                             f"center_rect={center_ok} (|dx|={center_dx:.1f}<={half_w:.1f}, |dy|={center_dy:.1f}<={half_h:.1f}), "
                             f"overlap={overlap_ok} (ratio={overlap_ratio:.2f} >= {overlap_threshold}) -> {status_text}"
                         )
-
-                    # Per-second INFO log while may-fall: expose two-rule satisfaction and escalation by streak only
-                    if (frame_index % log_sec_interval == 0):
-                        logger.info(
-                            f"frame={frame_index} track={tid} may_fall: center_rect={center_ok} "
-                            f"(dx={center_dx:.1f}/{half_w:.1f}, dy={center_dy:.1f}/{half_h:.1f}), "
-                            f"overlap={overlap_ok} (ratio={overlap_ratio:.2f}/{overlap_threshold}), "
-                            f"escalate(streak={may_streak_frames_by_track.get(tid, 0)}/{needed_frames}) => {status_text}"
-                        )
                 else:
                     # not may fall
                     status_text = "Falling" if falling else "No Falling"
                     if falling:
                         color = (0, 0, 255)
+
+                if (frame_index % log_sec_interval == 0):
+                    streak_frames = may_streak_frames_by_track.get(tid, 0)
+                    rule_summary_parts = [
+                        f"fall_score>=0.6:{may_fall_base} (smoothed={smoothed_score:.2f})",
+                        f"ankle_over_hip_then_hip_over_shoulder:{ankle_over_hip_and_hip_over_shoulder}",
+                        f"no_fall_cleaning_floor:{no_fall_by_cleaning_floor}",
+                        f"no_fall_shoulder_between:{no_fall_by_shoulder_between}",
+                        f"no_fall_angle_wrist:{no_fall_by_angle_and_wrist_ankle}",
+                        f"no_fall_tall_large:{no_fall_by_tall_large}",
+                        f"streak>=3s:{escalate_by_streak} ({streak_frames}/{needed_frames})",
+                    ]
+                    if center_ok is None or half_w is None or half_h is None or center_dx is None or center_dy is None:
+                        rule_summary_parts.append("center_rect:n/a")
+                    else:
+                        rule_summary_parts.append(
+                            f"center_rect:{center_ok} (dx={center_dx:.1f}/{half_w:.1f}, dy={center_dy:.1f}/{half_h:.1f})"
+                        )
+                    if overlap_ok is None or overlap_ratio is None:
+                        rule_summary_parts.append("overlap>=0.6:n/a")
+                    else:
+                        rule_summary_parts.append(f"overlap>=0.6:{overlap_ok} (ratio={overlap_ratio:.2f})")
+                    rule_summary_parts.append(f"on_bed:{on_bed}")
+                    logger.info(
+                        f"frame={frame_index} track={tid} state={status_text} may_fall={may_fall} "
+                        f"falling={falling} | " + "; ".join(rule_summary_parts)
+                    )
 
                 draw_rounded_rectangle(frame, (x1i, y1i), (x2i, y2i), color, thickness=3, radius=12)
                 put_label_above_box(frame, status_text, (x1i, y1i, x2i, y2i), (255, 255, 255))
@@ -706,10 +812,15 @@ def process_video(
                 logger.debug(
                     f"frame={frame_index} summary: dets={len(boxes)}, falling={per_frame_fall_count}"
                 )
+            last_display_frame = frame
             if show:
                 cv2.imshow("Fall Detection (Pose)", frame)
-                if cv2.waitKey(1) & 0xFF == 27:  # ESC to exit
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:  # ESC to exit
                     break
+                if key in (ord('q'), ord('Q')):
+                    paused = True
+                    logger.info("Paused playback. Press 'q' to resume or ESC to exit.")
             frame_index += 1
     finally:
         cap.release()
@@ -718,5 +829,3 @@ def process_video(
             cv2.destroyAllWindows()
 
     return out_path
-
-
