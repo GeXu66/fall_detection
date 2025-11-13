@@ -27,6 +27,7 @@ dataset/
 
 # Model weights directories
 weights/
+results/
 
 # Common weight/serialization file types
 *.pt

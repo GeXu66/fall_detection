@@ -296,8 +296,6 @@ def process_video(
 
             active_tracks = updated_tracks
 
-            # (Removed legacy overlap/keypoint mask heuristics; using multi-rule (center/bottom/overlap) instead)
-
             # Render per detection
             per_frame_fall_count = 0
             for i, box in enumerate(boxes):
@@ -345,6 +343,83 @@ def process_video(
 
                 # Base rule from score -> may fall
                 may_fall_base = smoothed_score >= 0.6  # threshold tuned empirically
+                
+                # New NO-FALL rule (cleaning floor posture):
+                # For each side, define:
+                #   a1 = vector(left_shoulder -> left_hip), b1 = vector(left_hip -> left_knee), c1 = vector(left_knee -> left_ankle)
+                # If angle(a1, b1) and angle(b1, c1) are both acute (< 90 deg), mark as no falling.
+                # Apply similarly for the right side; if either side satisfies, treat as no fall.
+                no_fall_by_cleaning_floor = False
+                try:
+                    # Indices
+                    ls = COCO_KP_NAMES.index("left_shoulder")
+                    lh = COCO_KP_NAMES.index("left_hip")
+                    lk = COCO_KP_NAMES.index("left_knee")
+                    la = COCO_KP_NAMES.index("left_ankle")
+                    rs = COCO_KP_NAMES.index("right_shoulder")
+                    rh = COCO_KP_NAMES.index("right_hip")
+                    rk = COCO_KP_NAMES.index("right_knee")
+                    ra = COCO_KP_NAMES.index("right_ankle")
+
+                    def kp_ok(idx: int) -> bool:
+                        return float(kp[idx][2]) >= 0.3
+
+                    def vec(i_from: int, i_to: int):
+                        return (float(kp[i_to][0]) - float(kp[i_from][0]), float(kp[i_to][1]) - float(kp[i_from][1]))
+
+                    def angle_deg(v1, v2):
+                        vx1, vy1 = v1
+                        vx2, vy2 = v2
+                        n1 = math.hypot(vx1, vy1)
+                        n2 = math.hypot(vx2, vy2)
+                        if n1 <= 1e-6 or n2 <= 1e-6:
+                            return None
+                        cosang = max(-1.0, min(1.0, (vx1 * vx2 + vy1 * vy2) / (n1 * n2)))
+                        return math.degrees(math.acos(cosang))
+
+                    # Initialize for debug prints even if some branches are skipped
+                    ang_ab = None
+                    ang_bc = None
+                    ang_ab_r = None
+                    ang_bc_r = None
+
+                    left_ok = False
+                    if kp_ok(ls) and kp_ok(lh) and kp_ok(lk) and kp_ok(la):
+                        # Hip angle: vectors from hip to shoulder and hip to knee
+                        a1 = vec(lh, ls)
+                        b1 = vec(lh, lk)
+                        # Knee angle: vectors from knee to hip and knee to ankle
+                        c1 = vec(lk, la)
+                        ang_ab = angle_deg(a1, b1)
+                        ang_bc = angle_deg(vec(lk, lh), c1)
+                        if ang_ab is not None and ang_bc is not None:
+                            if (ang_ab < 90.0) and (ang_bc < 90.0):
+                                left_ok = True
+
+                    right_ok = False
+                    if kp_ok(rs) and kp_ok(rh) and kp_ok(rk) and kp_ok(ra):
+                        # Hip angle: vectors from hip to shoulder and hip to knee
+                        a1r = vec(rh, rs)
+                        b1r = vec(rh, rk)
+                        # Knee angle: vectors from knee to hip and knee to ankle
+                        c1r = vec(rk, ra)
+                        ang_ab_r = angle_deg(a1r, b1r)
+                        ang_bc_r = angle_deg(vec(rk, rh), c1r)
+                        if ang_ab_r is not None and ang_bc_r is not None:
+                            if (ang_ab_r < 90.0) and (ang_bc_r < 90.0):
+                                right_ok = True
+                    # if frame_index % 25 == 0:
+                    #     print('--------------------------------')
+                    #     print('angle_ab', ang_ab)
+                    #     print('angle_bc', ang_bc)
+                    #     print('angle_ab_r', ang_ab_r)
+                    #     print('angle_bc_r', ang_bc_r)
+                    #     print('left_ok', left_ok)
+                    #     print('right_ok', right_ok)
+
+                    no_fall_by_cleaning_floor = left_ok or right_ok
+                except Exception:
+                    no_fall_by_cleaning_floor = False
 
                 # New rule: ankle above hip AND hip above shoulder implies may fall
                 ankle_over_hip_and_hip_over_shoulder = False
@@ -433,14 +508,40 @@ def process_video(
                     no_fall_by_angle_and_wrist_ankle = side_ok(ls, lh, lk, lw, la) or side_ok(rs, rh, rk, rw, ra)
                 except Exception:
                     no_fall_by_angle_and_wrist_ankle = False
+                
+                # If bbox is significantly wider than tall, do not allow no-fall suppressors to trigger
+                box_w_current = max(1.0, float(box[2] - box[0]))
+                box_h_current = max(1.0, float(box[3] - box[1]))
+                if (box_w_current / box_h_current) > 1.3:
+                    no_fall_by_shoulder_between = False
+                    no_fall_by_angle_and_wrist_ankle = False
+                
+                # New NO-FALL rule: tall bbox and its (height + width) exceeds image height
+                no_fall_by_tall_large = False
+                try:
+                    bw = float(max(1.0, box[2] - box[0]))
+                    bh = float(max(1.0, box[3] - box[1]))
+                    if (bw < bh) and ((bw + bh) > float(height)):
+                        no_fall_by_tall_large = True
+                except Exception:
+                    no_fall_by_tall_large = False
 
                 if ankle_over_hip_and_hip_over_shoulder:
                     # Give priority: this posture implies May fall regardless of no-fall suppressors
                     may_fall = True
                 else:
                     # Otherwise, apply suppressors to the base score rule
-                    may_fall = may_fall_base and (not no_fall_by_shoulder_between) and (not no_fall_by_angle_and_wrist_ankle)
-
+                    may_fall = (
+                        may_fall_base
+                        and (not no_fall_by_cleaning_floor)
+                        and (not no_fall_by_shoulder_between)
+                        and (not no_fall_by_angle_and_wrist_ankle)
+                        and (not no_fall_by_tall_large)
+                    )
+                # if frame_index % 25 == 0:
+                #     print('may_fall_base', may_fall_base)
+                #     print('no_fall_by_angle_and_wrist_ankle', no_fall_by_angle_and_wrist_ankle)
+                #     print('no_fall_by_shoulder_between', no_fall_by_shoulder_between)
                 # Prepare A point and an early on-bed check to suppress escalation while on bed
                 x1i, y1i, x2i, y2i = xyxy_int(tuple(box.tolist()), width, height)
                 ax = int((x1i + x2i) * 0.5)

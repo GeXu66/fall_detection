@@ -239,9 +239,9 @@ def compute_fall_score(points: np.ndarray, box_xyxy: Tuple[float, float, float, 
 
     # Additional rule: wider-than-tall bbox (w/h > 0.6) increases fall likelihood
     bbox_rule_bonus = 0.0
-    if bbox_ar > 0.6:
+    if bbox_ar > 0.65:
         # Grows linearly from 0 when ar==0.6 up to a small cap
-        bbox_rule_bonus = min(0.5, max(0.0, (bbox_ar - 0.6) * 3))
+        bbox_rule_bonus = bbox_ar
 
     # Aggregate with weights
     weights = {
