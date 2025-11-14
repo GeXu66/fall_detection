@@ -12,6 +12,7 @@ from fall_detector import process_video
 DEFAULT_INPUT = "./dataset/Real/fall/video1.mp4"
 
 
+
 def main(argv: Optional[List[str]] = None) -> None:
     raw_args = sys.argv[1:] if argv is None else argv
 
@@ -45,7 +46,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--seg-size",
         type=str,
         choices=["n", "s", "m", "l", "x"],
-        default="s",
+        default="n",
         help="Segmentation model size for bed detection: n, s, m, l, x.",
     )
     parser.add_argument(

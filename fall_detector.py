@@ -500,6 +500,19 @@ def process_video(
                             print('right_ok', right_ok)
                 except Exception:
                     no_fall_by_cleaning_floor = False
+                if no_fall_by_cleaning_floor:
+                    # Require at least 3 reliable face keypoints to trust this rule
+                    face_kps = ["nose", "left_eye", "right_eye", "left_ear", "right_ear"]
+                    reliable_face_points = 0
+                    for name in face_kps:
+                        try:
+                            idx = COCO_KP_NAMES.index(name)
+                            if float(kp[idx][2]) >= 0.3:
+                                reliable_face_points += 1
+                        except Exception:
+                            continue
+                    if reliable_face_points < 3:
+                        no_fall_by_cleaning_floor = False
 
                 # New rule: ankle above hip AND hip above shoulder implies may fall
                 ankle_over_hip_and_hip_over_shoulder = False
@@ -550,7 +563,7 @@ def process_video(
 
 
 
-                # New NO-FALL rule: angle(hip->shoulder, hip->knee) < 45 deg AND wrist-ankle distance is small
+                # New NO-FALL rule: angle(hip->shoulder, hip->knee) < 90 deg AND wrist-ankle distance is small
                 no_fall_by_angle_and_wrist_ankle = False
                 try:
                     # Left side
@@ -588,6 +601,24 @@ def process_video(
                     no_fall_by_angle_and_wrist_ankle = side_ok(ls, lh, lk, lw, la) or side_ok(rs, rh, rk, rw, ra)
                 except Exception:
                     no_fall_by_angle_and_wrist_ankle = False
+                # New NO-FALL rule: both wrists close to their corresponding ankles (relative to bbox width)
+                no_fall_by_wrist_ankle_width = False
+                try:
+                    lw = COCO_KP_NAMES.index("left_wrist")
+                    la = COCO_KP_NAMES.index("left_ankle")
+                    rw = COCO_KP_NAMES.index("right_wrist")
+                    ra = COCO_KP_NAMES.index("right_ankle")
+
+                    left_valid = float(kp[lw][2]) >= 0.3 and float(kp[la][2]) >= 0.3
+                    right_valid = float(kp[rw][2]) >= 0.3 and float(kp[ra][2]) >= 0.3
+                    if left_valid and right_valid:
+                        left_dist = math.hypot(float(kp[lw][0]) - float(kp[la][0]), float(kp[lw][1]) - float(kp[la][1]))
+                        right_dist = math.hypot(float(kp[rw][0]) - float(kp[ra][0]), float(kp[rw][1]) - float(kp[ra][1]))
+                        box_w_local = max(1.0, float(box[2] - box[0]))
+                        dist_limit = 0.3 * box_w_local
+                        no_fall_by_wrist_ankle_width = (left_dist <= dist_limit) and (right_dist <= dist_limit)
+                except Exception:
+                    no_fall_by_wrist_ankle_width = False
                 
                 # If bbox is significantly wider than tall, do not allow no-fall suppressors to trigger
                 box_w_current = max(1.0, float(box[2] - box[0]))
@@ -595,6 +626,7 @@ def process_video(
                 if (box_w_current / box_h_current) > 1.3:
                     no_fall_by_shoulder_between = False
                     no_fall_by_angle_and_wrist_ankle = False
+                    no_fall_by_wrist_ankle_width = False
                 
                 # New NO-FALL rule: tall bbox and its (height + width) exceeds image height
                 no_fall_by_tall_large = False
@@ -616,6 +648,7 @@ def process_video(
                         and (not no_fall_by_cleaning_floor)
                         and (not no_fall_by_shoulder_between)
                         and (not no_fall_by_angle_and_wrist_ankle)
+                        and (not no_fall_by_wrist_ankle_width)
                         and (not no_fall_by_tall_large)
                     )
                 # if frame_index % 25 == 0:
@@ -767,6 +800,7 @@ def process_video(
                         f"no_fall_shoulder_between:{no_fall_by_shoulder_between}",
                         f"no_fall_angle_wrist:{no_fall_by_angle_and_wrist_ankle}",
                         f"no_fall_tall_large:{no_fall_by_tall_large}",
+                        f"no_fall_wrist_ankle_width:{no_fall_by_wrist_ankle_width}",
                         f"streak>=3s:{escalate_by_streak} ({streak_frames}/{needed_frames})",
                     ]
                     if center_ok is None or half_w is None or half_h is None or center_dx is None or center_dy is None:
